@@ -1,0 +1,217 @@
+=============================================================
+  CONTENT BROADCASTING SYSTEM — ARCHITECTURE NOTES
+=============================================================
+
+1. AUTHENTICATION & RBAC FLOW
+------------------------------
+- JWT (JSON Web Tokens) are used for stateless authentication.
+- On login, the server signs a JWT containing { id, role } with a secret key.
+- Every protected route passes through the `authenticate` middleware which:
+    1. Extracts the Bearer token from the Authorization header
+    2. Verifies signature and expiry using jwt.verify()
+    3. Fetches the user from DB and attaches to req.user
+- The `authorize(...roles)` middleware checks req.user.role against allowed roles.
+- Two roles exist: `principal` and `teacher`.
+  * Teachers: can upload content, view own content/status, view schedule
+  * Principal: can view all content, approve/reject content
+- Role separation is enforced at route level (not just controller level).
+- Passwords are hashed using bcrypt (12 salt rounds) before storage.
+- No plaintext passwords are ever stored or returned.
+
+2. SUBJECT-BASED SYSTEM DESIGN
+--------------------------------
+- Every piece of content belongs to a `subject` (e.g., maths, science).
+- Subjects are normalized to lowercase to prevent duplicates (Maths == maths).
+- ContentSlot represents a broadcast channel per (teacher + subject) pair.
+- Each teacher can have multiple slots (one per subject they teach).
+- ContentSchedule links content to a slot with a rotation_order and duration.
+- On content approval, a slot is auto-created (if not already existing) and
+  the content is added to the rotation queue for that slot.
+- This design allows independent rotations per subject per teacher.
+
+3. UPLOAD HANDLING APPROACH
+-----------------------------
+- Multer is used for multipart/form-data parsing and disk storage.
+- Files are stored in the local `uploads/` directory (configurable via .env).
+- Filename is generated as: content-{timestamp}-{random}.{ext} to avoid collisions.
+- Two validations are enforced:
+    1. fileFilter: checks MIME type (image/jpeg, image/png, image/gif) AND extension
+    2. limits.fileSize: enforces max 10MB (configurable via MAX_FILE_SIZE env var)
+- If the DB insert fails after file upload, the uploaded file is deleted (cleanup).
+- Files are served statically at /uploads/:filename.
+- S3 upload is listed as a bonus — the upload middleware can be swapped out by
+  replacing multer DiskStorage with multer-s3 or a custom S3 upload wrapper.
+
+4. APPROVAL WORKFLOW DESIGN
+-----------------------------
+Content lifecycle:  uploaded → pending → approved OR rejected
+
+- All newly uploaded content starts with status = 'pending'.
+- Only the principal can call PATCH /content/:id/approve or /content/:id/reject.
+- Rejection REQUIRES a reason (enforced at both validation and service layer).
+- On approval:
+    * status set to 'approved', approved_by = principal's ID, approved_at = now
+    * ContentSlot is ensured (created if missing)
+    * ContentSchedule entry is created with next rotation_order and duration
+- On rejection:
+    * status set to 'rejected', rejection_reason stored
+- Approved content is ONLY shown on the public API if it also falls within
+  the teacher-defined start_time / end_time window.
+
+5. SCHEDULING / ROTATION LOGIC (VERY IMPORTANT)
+-------------------------------------------------
+Design Goals:
+  - Stateless: No cron jobs, no background workers, no DB writes needed to advance rotation.
+  - Deterministic: Any server instance at any point in time returns the same active content.
+  - Independent per subject: Maths rotation doesn't affect Science rotation.
+
+Algorithm:
+  Step 1 — Filter eligible content:
+    SELECT approved content WHERE uploaded_by = teacherId
+    AND start_time <= NOW() AND end_time >= NOW()
+
+  Step 2 — Group by subject:
+    { "maths": [contentA, contentB], "science": [contentX] }
+
+  Step 3 — For each subject, sort items by rotation_order ASC.
+
+  Step 4 — Calculate total cycle duration:
+    totalCycleMs = SUM(item.duration * 60 * 1000) for all items in subject
+
+  Step 5 — Find position in cycle:
+    elapsedMs = (Date.now() - CYCLE_EPOCH) % totalCycleMs
+    where CYCLE_EPOCH = fixed point in time (e.g., 2024-01-01T00:00:00Z)
+
+  Step 6 — Walk through items to find active one:
+    cursor = 0
+    for each item in rotation_order:
+      if elapsedMs >= cursor AND elapsedMs < cursor + item.durationMs:
+        return item  ← this is the currently active content
+      cursor += item.durationMs
+
+Example:
+  Maths has: ContentA (5 min), ContentB (5 min), ContentC (5 min)
+  totalCycle = 15 min = 900,000 ms
+  At t=0-4:59   → ContentA is live
+  At t=5-9:59   → ContentB is live
+  At t=10-14:59 → ContentC is live
+  At t=15       → loops back to ContentA
+
+Edge Cases Handled:
+  - No approved content → return "No content available"
+  - Content approved but no start_time/end_time → excluded from live feed
+  - start_time/end_time outside current time → excluded from live feed
+  - Invalid subject in query → return "No content available" (not error)
+  - Invalid teacher ID → return "No content available" (not error)
+  - Only 1 content in subject → always that content (no rotation needed)
+
+6. DATABASE DESIGN DECISIONS
+------------------------------
+Tables:
+  users              — stores principals and teachers (role ENUM)
+  contents           — all uploaded content with status lifecycle
+  content_slots      — one row per (teacher_id, subject) pair
+  content_schedules  — rotation config: links content to slot with order + duration
+
+Key decisions:
+  - UUIDs as primary keys: avoids sequential ID guessing in public endpoints
+  - subject stored as lowercase string: flexible (no hardcoded enum of subjects)
+  - ContentSlot separates the "broadcast channel" concept from individual content
+  - ContentSchedule acts as a join table WITH extra data (rotation_order, duration)
+  - start_time / end_time on Content (not Schedule): teacher controls per-content
+  - rotation_duration on Content: teacher sets this at upload time, copied to Schedule
+  - All timestamps use timezone-aware DATE type
+
+Indexes (recommended for production):
+  - contents(uploaded_by, status)
+  - contents(status, start_time, end_time)
+  - content_slots(teacher_id, subject) UNIQUE
+  - content_schedules(slot_id, rotation_order)
+
+7. FOLDER STRUCTURE
+--------------------
+src/
+  app.js                   ← Express app setup, middleware, route mounting, DB connect
+  config/
+    database.js            ← Sequelize instance
+    migrate.js             ← DB sync script
+    seed.js                ← Seed default users
+  models/
+    index.js               ← All models + associations
+    User.js                ← users table
+    Content.js             ← contents table
+    ContentSlot.js         ← content_slots table
+    ContentSchedule.js     ← content_schedules table
+  controllers/
+    authController.js      ← register, login, getMe
+    contentController.js   ← upload, approve, reject, live, schedule
+  services/
+    authService.js         ← bcrypt hashing, JWT generation
+    contentService.js      ← upload/approval business logic
+    schedulingService.js   ← rotation algorithm (core logic)
+  routes/
+    authRoutes.js          ← /auth/*
+    contentRoutes.js       ← /content/*
+  middlewares/
+    auth.js                ← authenticate (JWT verify) + authorize (RBAC)
+    upload.js              ← multer config (file type + size validation)
+    validate.js            ← express-validator error formatter
+    errorHandler.js        ← global error handler
+  utils/
+    response.js            ← response helper
+uploads/                   ← local file storage
+
+8. MIDDLEWARE USAGE
+--------------------
+Request pipeline for a protected route:
+  Request → helmet() → cors() → rateLimit() → json() → morgan()
+         → authenticate (JWT check) → authorize (role check)
+         → [upload (multer)] → [validate (express-validator)]
+         → controller → errorHandler
+
+- helmet: Sets security headers (XSS, clickjacking, etc.)
+- cors: Allows cross-origin requests (configure origins in production)
+- rateLimit: Applied to all /content routes (100 req/15min by default)
+- morgan: HTTP request logging in development
+- authenticate: Verifies JWT, attaches req.user
+- authorize: Checks req.user.role against allowed roles
+- upload (multer): Handles file parsing, type validation, size limits
+- validate: Runs express-validator checks, returns 400 on failure
+- errorHandler: Catches all errors, formats consistent JSON responses
+
+9. SCALABILITY APPROACH
+------------------------
+Current implementation handles single-server deployment well.
+For scaling:
+
+Caching (Bonus - Redis):
+  - Cache /content/live/:teacherId responses with TTL = min(rotation_duration)
+  - Invalidate cache on content approval/rejection or time window change
+  - Prevents DB queries on every student request
+  - Use Redis with ioredis: cache key = "live:{teacherId}" or "live:{teacherId}:{subject}"
+
+Rate Limiting:
+  - Currently in-memory via express-rate-limit
+  - For multi-server: use rate-limit-redis store to share counters across instances
+
+Database:
+  - Connection pooling already configured (max: 10 connections)
+  - Add read replicas for the public /content/live endpoint (high read traffic)
+  - Add indexes on (uploaded_by, status), (status, start_time, end_time)
+
+File Storage:
+  - Current: local disk (works for single server)
+  - Production: swap multer DiskStorage for multer-s3 (AWS S3)
+  - CDN in front of S3 for global low-latency file delivery
+
+Scheduling:
+  - Current algorithm is stateless and CPU-only — scales horizontally with no coordination
+  - No shared state required between server instances
+  - Works correctly even with multiple servers behind a load balancer
+
+Future:
+  - Queue (Bull + Redis) for async approval notifications (email to teacher)
+  - WebSockets / SSE for real-time live feed updates to students
+  - Horizontal scaling via PM2 cluster mode or Kubernetes
+
+=============================================================
