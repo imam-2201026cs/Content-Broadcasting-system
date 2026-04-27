@@ -6,7 +6,7 @@ A backend system for educational environments where teachers upload content (que
 
 - **Runtime**: Node.js
 - **Framework**: Express.js
-- **Database**: PostgreSQL (via Sequelize ORM)
+- **Database**: MongoDB (via Mongoose ODM)
 - **Authentication**: JWT (jsonwebtoken) + bcrypt
 - **File Upload**: Multer (local disk storage)
 - **Validation**: express-validator
@@ -28,7 +28,7 @@ A backend system for educational environments where teachers upload content (que
 ### Prerequisites
 
 - Node.js v18+
-- PostgreSQL 14+
+- MongoDB v6+ (Local or MongoDB Atlas)
 
 ### 1. Clone & Install
 
@@ -50,11 +50,7 @@ Edit `.env`:
 PORT=3000
 NODE_ENV=development
 
-DB_HOST=localhost
-DB_PORT=5432
-DB_NAME=content_broadcasting
-DB_USER=postgres
-DB_PASSWORD=yourpassword
+MONGODB_URI=mongodb://localhost:27017/content_broadcasting
 
 JWT_SECRET=your_super_secret_key
 JWT_EXPIRES_IN=7d
@@ -63,22 +59,12 @@ MAX_FILE_SIZE=10485760
 UPLOAD_DIR=uploads
 ```
 
-### 3. Create Database
+### 3. Seed Default Users
 
-```sql
-CREATE DATABASE content_broadcasting;
-```
-
-### 4. Run Migrations
+Run this command to create the initial Principal and Teacher accounts:
 
 ```bash
-npm run db:migrate
-```
-
-### 5. Seed Default Users
-
-```bash
-npm run db:seed
+npm run seed
 ```
 
 Default accounts after seeding:
@@ -90,7 +76,7 @@ Default accounts after seeding:
 | Teacher 2 | teacher2@school.com     | teacher123   |
 | Teacher 3 | teacher3@school.com     | teacher123   |
 
-### 6. Start Server
+### 4. Start Server
 
 ```bash
 # Development (with auto-reload)
@@ -309,7 +295,6 @@ src/
   app.js
   config/
     database.js
-    migrate.js
     seed.js
   models/
     index.js
